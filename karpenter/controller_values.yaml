@@ -1,0 +1,22 @@
+# karpenter/controller_values.yaml
+settings:
+  clusterName: ${CLUSTER_NAME}
+  interruptionQueue: demo-ue1-ifx-d-sqs-karpenter-spot-events 
+  featureGates:
+    SpotToSpotConsolidation: true  # Enable Spot-to-Spot consolidation
+
+# Ensure Karpenter schedules on bootstrap (managed node group) nodes
+affinity:
+  nodeAffinity:
+    requiredDuringSchedulingIgnoredDuringExecution:
+      nodeSelectorTerms:
+        - matchExpressions:
+            - key: karpenter.sh/nodepool
+              operator: DoesNotExist
+            - key: eks.amazonaws.com/nodegroup
+              operator: In
+              values:
+                - ${NODEGROUP}  
+  podAntiAffinity:
+    requiredDuringSchedulingIgnoredDuringExecution:
+      - topologyKey: "kubernetes.io/hostname"

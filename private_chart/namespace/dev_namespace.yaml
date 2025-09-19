@@ -1,0 +1,5 @@
+namespaces:
+  - karpenter
+
+environment: dev
+owner: sneha.tuladhar

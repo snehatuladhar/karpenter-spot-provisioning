@@ -1,0 +1,159 @@
+name: Karpenter Provisioning
+run-name: '[${{ github.event_name }} - ${{ github.ref_name }}] provisioned by @${{ github.actor }}'
+
+on:
+  workflow_dispatch:
+     inputs:
+        commitsha:
+          description: Commit Hash to be used in manifest rollback
+        environment:
+          description: 'Environment:'
+          type: choice
+          required: true
+          default: 'dev'
+          options:
+              - dev
+              - stage
+              - prod
+
+permissions:
+  id-token: write
+  contents: read
+  pull-requests: write
+
+env:
+  terraformS3Acl: bucket-owner-full-control
+  terraformBucket: demo-terraform-state
+  terraformDynamo: demo-terraform-state
+  oidcRoleName: demo-github-oidc-role
+  terraformS3Encryption: true
+  terraformVersion: 1.9.5
+  awsRegion: us-east-1
+  shaToDeploy: ${{ github.event.inputs.commitsha || github.sha }}
+
+
+  # Kubernetes
+  privateNamespaceChart: private_chart/namespace
+  karpenterChartVersion: 1.6.2
+  helmVersion: 3.17.0
+
+
+jobs:
+  deploy:
+    name: Kubernetes Common Resources
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+      with:
+        ref: ${{ env.shaToDeploy }}
+
+    - name: Install JQ Tool
+      uses: mbround18/install-jq@v1
+
+    - name: Setup Terraform
+      uses: hashicorp/setup-terraform@v3.0.0
+      with:
+        terraform_version: ${{ env.terraformVersion }}
+        terraform_wrapper: false
+
+    - name: Setup helm version ${{ env.helmVersion }}
+      id: install-helm
+      uses: azure/setup-helm@v4.2.0
+      with:
+          version: ${{ env.helmVersion }}
+
+    - name: Sets env vars for dev environment
+      if: github.event.inputs.environment == 'dev'
+      run: |
+          echo "terraformS3Key=${{ secrets.DEV_ACCOUNT_ID}}/demo-cloud/demo-infra-terraform/dev.tfstate" >> $GITHUB_ENV
+          echo "namespaceValues=${{ github.event.inputs.environment }}_namespace.yaml" >> $GITHUB_ENV
+          echo "accountProfile=${{ github.event.inputs.environment }}" >> $GITHUB_ENV
+          echo "accountId=${{ secrets.DEV_ACCOUNT_ID }}" >> $GITHUB_ENV
+
+    - name: Sets env vars for stage environment
+      if: github.event.inputs.environment == 'stage'
+      run: |
+          echo "terraformS3Key=${{ secrets.STAGE_ACCOUNT_ID}}/demo-cloud/demo-infra-terraform/stage.tfstate" >> $GITHUB_ENV
+          echo "namespaceValues=${{ github.event.inputs.environment }}_namespace.yaml" >> $GITHUB_ENV
+          echo "accountProfile=${{ github.event.inputs.environment }}" >> $GITHUB_ENV
+          echo "accountId=${{ secrets.STAGE_ACCOUNT_ID }}" >> $GITHUB_ENV
+
+    - name: Sets env vars for prod environment
+      if: github.event.inputs.environment == 'prod'
+      run: |
+          echo "terraformS3Key=${{ secrets.PROD_ACCOUNT_ID}}/demo-cloud/demo-infra-terraform/main.tfstate" >> $GITHUB_ENV
+          echo "namespaceValues=${{ github.event.inputs.environment }}_namespace.yaml" >> $GITHUB_ENV
+          echo "accountProfile=${{ github.event.inputs.environment }}" >> $GITHUB_ENV
+          echo "accountId=${{ secrets.PROD_ACCOUNT_ID }}" >> $GITHUB_ENV
+
+    - name: configure aws credentials for ${{ env.accountProfile }} account
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        role-to-assume: arn:aws:iam::${{ env.accountId }}:role/${{ env.oidcRoleName }}
+        role-session-name: OIDCSession
+        aws-region: ${{ env.awsRegion }}
+
+    - name: Fetch Terraform state outputs
+      uses: mathiasvr/command-output@v2.0.0
+      id: get-resource-name
+      with:
+        run: |
+          state_file_name=${{ env.terraformS3Key }}
+          aws s3 cp s3://${{ env.terraformBucket }}/${{ env.terraformS3Key }} $state_file_name
+
+          # Cluster name
+          cluster_name=$(terraform output --json -state=$state_file_name | jq -r '.cluster_name.value')
+          echo "CLUSTER_NAME=$cluster_name" >> "$GITHUB_ENV"
+
+          # # EKS Node Group Name
+          node_group_name=$(aws eks list-nodegroups --cluster-name $cluster_name --region ${{ env.awsRegion }} --query 'nodegroups[0]' --output text)
+          echo "NODE_GROUP_NAME=$node_group_name" >> "$GITHUB_ENV"
+          
+    - name: Update kubeconfig for EKS Cluster
+      run: |
+        aws eks update-kubeconfig --name ${{ env.CLUSTER_NAME }} --region ${{ env.awsRegion }}
+
+    - name: Namespaces creation dry-run
+      id: ns-dry-run
+      working-directory: ${{ env.privateNamespaceChart }}
+      run: |
+        helm upgrade --install demo-namespace ./ --values ${{ env.namespaceValues }} --dry-run --debug
+
+    - name: Create necessary namespaces
+      if : steps.ns-dry-run.outputs.exit-code == 0
+      working-directory: ${{ env.privateNamespaceChart }}
+      run: |
+        helm upgrade --install demo-namespace ./ --values ${{ env.namespaceValues }}
+  
+    - name: Substitute cluster name in values
+      run: |
+       sed -i "s/\${CLUSTER_NAME}/${{ env.CLUSTER_NAME }}/g" karpenter/controller_values.yaml
+       sed -i "s/\${CLUSTER_NAME}/${{ env.CLUSTER_NAME }}/g" karpenter/spot-ec2nodeclass.yaml
+       sed -i "s/\${CLUSTER_NAME}/${{ env.CLUSTER_NAME }}/g" karpenter/spot-nodepool.yaml
+       sed -i "s/\${NODEGROUP}/${{ env.NODE_GROUP_NAME }}/g" karpenter/controller_values.yaml
+
+    - name: Install Karpenter CRDs
+      run: |
+        kubectl apply -f "https://raw.githubusercontent.com/aws/karpenter-provider-aws/v${{ env.karpenterChartVersion }}/pkg/apis/crds/karpenter.sh_nodepools.yaml"
+        kubectl apply -f "https://raw.githubusercontent.com/aws/karpenter-provider-aws/v${{ env.karpenterChartVersion }}/pkg/apis/crds/karpenter.k8s.aws_ec2nodeclasses.yaml"
+        kubectl apply -f "https://raw.githubusercontent.com/aws/karpenter-provider-aws/v${{ env.karpenterChartVersion }}/pkg/apis/crds/karpenter.sh_nodeclaims.yaml"
+
+
+    - name: Install Karpenter with Spot configuration
+      run: |
+        helm upgrade --install karpenter oci://public.ecr.aws/karpenter/karpenter \
+          --version ${{ env.karpenterChartVersion }} \
+          --namespace karpenter \
+          --set serviceAccount.name=demo-dev-karpenter-serviceaccount \
+          --set serviceAccount.create=true \
+          --set settings.clusterName=${{ env.CLUSTER_NAME }} \
+          --set settings.interruptionQueue=demo-ue1-ifx-d-sqs-karpenter-spot-events \
+          -f karpenter/controller_values.yaml
+
+    - name: Apply Karpenter Spot NodePool + EC2NodeClass
+      run: |
+        kubectl apply -f karpenter/spot-ec2nodeclass.yaml
+        kubectl apply -f karpenter/spot-nodepool.yaml 
+        kubectl apply -f karpenter/aws-auth-patch.yaml     
